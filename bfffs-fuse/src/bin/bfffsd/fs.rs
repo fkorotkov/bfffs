@@ -529,14 +529,21 @@ impl Filesystem for FuseFs {
     fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr,
         newparent: u64, newname: &OsStr, reply: ReplyEmpty)
     {
+        let new_fd = self.names.remove(&(newparent, newname.to_owned()))
+            .map(|ino| self.files.remove(&ino))
+            // NB could use Option::flatten once that's stabilized
+            // https://github.com/rust-lang/rust/issues/60258
+            .and_then(std::convert::identity);
         let parent_fd = self.files.get(&parent)
             .expect("rename before lookup or after forget of parent");
         let newparent_fd = self.files.get(&newparent)
             .expect("rename before lookup or after forget of new parent");
 
         // Dirloop check
-        let target_ino = *self.names.get(&(parent, name.to_owned()))
-            .expect("rename before lookup or after forget of target");
+        let src_ino = *self.names.get(&(parent, name.to_owned()))
+            .expect("rename before lookup or after forget of source");
+        let src_fd = self.files.get(&src_ino)
+            .expect("rename before lookup or after forget of source");
         let mut fd = self.files.get(&newparent)
             .expect("Uncached destination directory");
         loop {
@@ -545,7 +552,7 @@ impl Filesystem for FuseFs {
                     // Root directory, or not a directory
                     break;
                 },
-                Some(ino) if target_ino == ino => {
+                Some(ino) if src_ino == ino => {
                     // Dirloop detected!
                     reply.error(libc::EINVAL);
                     return;
@@ -558,9 +565,11 @@ impl Filesystem for FuseFs {
             }
         }
 
-        match self.fs.rename(&parent_fd, name, &newparent_fd, newname) {
+        match self.fs.rename(&parent_fd, &src_fd, name, &newparent_fd,
+            new_fd, newname)
+        {
             Ok(ino) => {
-                assert_eq!(ino, target_ino);
+                assert_eq!(ino, src_ino);
                 // Remove the cached destination file, if any
                 self.uncache_name(newparent, newname);
                 // Remove the cached source name (but not inode)
@@ -2851,8 +2860,10 @@ mod rename {
             .times(1)
             .with(
                 predicate::function(move |fd: &FileData| fd.ino() == parent),
+                predicate::function(move |fd: &FileData| fd.ino() == ino),
                 predicate::eq(name),
                 predicate::function(move |fd: &FileData| fd.ino() == newparent),
+                predicate::function(move |fd: &Option<FileData>| fd.is_none()),
                 predicate::eq(newname),
             ).return_const(Ok(ino));
 
@@ -2866,11 +2877,13 @@ mod rename {
         assert_eq!(Some(newparent), fusefs.files.get(&ino).unwrap().parent());
     }
 
+    // Rename fails because the src is a directory but the dst is not.
     #[test]
     fn enotdir() {
         let parent = 42;
         let newparent = 43;
         let ino = 44;
+        let dst_ino = 45;
         let name = OsStr::from_bytes(b"foo");
         let newname = OsStr::from_bytes(b"bar");
 
@@ -2887,8 +2900,11 @@ mod rename {
             .times(1)
             .with(
                 predicate::function(move |fd: &FileData| fd.ino() == parent),
+                predicate::function(move |fd: &FileData| fd.ino() == ino),
                 predicate::eq(name),
                 predicate::function(move |fd: &FileData| fd.ino() == newparent),
+                predicate::function(move |fd: &Option<FileData>|
+                                    fd.as_ref().unwrap().ino() == dst_ino),
                 predicate::eq(newname),
             ).return_const(Err(libc::ENOTDIR));
 
@@ -2896,6 +2912,10 @@ mod rename {
         fusefs.files.insert(newparent,
             FileData::new_for_tests(None, newparent));
         fusefs.names.insert((parent, name.to_owned()), ino);
+        fusefs.files.insert(ino, FileData::new_for_tests(Some(parent), ino));
+        fusefs.files.insert(dst_ino,
+            FileData::new_for_tests(Some(newparent), dst_ino));
+        fusefs.names.insert((newparent, newname.to_owned()), dst_ino);
         fusefs.rename(&request, parent, name, newparent, newname, reply);
         assert_not_cached(&fusefs, newparent, newname, None);
     }
@@ -2979,8 +2999,10 @@ mod rename {
             .times(1)
             .with(
                 predicate::function(move |fd: &FileData| fd.ino() == parent),
+                predicate::function(move |fd: &FileData| fd.ino() == ino),
                 predicate::eq(name),
                 predicate::function(move |fd: &FileData| fd.ino() == newparent),
+                predicate::function(move |fd: &Option<FileData>| fd.is_none()),
                 predicate::eq(newname),
             ).return_const(Ok(ino));
 
